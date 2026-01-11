@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"syscall"
 )
 
 const (
@@ -33,27 +34,66 @@ func NewBackend(address string) *Backend {
 	return b
 }
 
+func isConnClosed(c net.Conn) bool {
+    tc, ok := c.(*net.TCPConn)
+    if !ok {
+        return false 
+    }
+
+    rawConn, err := tc.SyscallConn()
+    if err != nil {
+        return true
+    }
+
+    var sysErr error
+    var n int
+
+    err = rawConn.Read(func(fd uintptr) bool {
+        var buf [1]byte
+        n, _, sysErr = syscall.Recvfrom(int(fd), buf[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+        return true
+    })
+
+    if sysErr == syscall.EAGAIN || sysErr == syscall.EWOULDBLOCK {
+        return false
+    }
+
+    if n == 0 && sysErr == nil {
+        return true
+    }
+    if sysErr != nil {
+        return true
+    }
+    return false
+}
+
 func (b *Backend) getConn() (net.Conn, error) {
 	// Try to get from pool first
-	select {
-	case conn := <-b.connPool:
-		return conn, nil
-	default:
-		// Create new if none in pool
-		conn, err := net.DialTimeout("tcp", b.address, 3*time.Second)
-		if err != nil {
-			return nil, err
+	for{
+		select {
+		case conn := <-b.connPool:
+			if isConnClosed(conn) {
+				conn.Close()
+				continue
+			}
+			return conn, nil
+		default:
+			// Create new if none in pool
+			conn, err := net.DialTimeout("tcp", b.address, 3*time.Second)
+			if err != nil {
+				return nil, err
+			}
+	
+			if tc, ok := conn.(*net.TCPConn); ok {
+				tc.SetNoDelay(true)
+				tc.SetKeepAlive(true)
+				tc.SetKeepAlivePeriod(30 * time.Second)
+				tc.SetReadBuffer(BUFFER_SIZE)
+				tc.SetWriteBuffer(BUFFER_SIZE)
+			}
+	
+			return conn, nil
 		}
-
-		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
-			tc.SetKeepAlive(true)
-			tc.SetKeepAlivePeriod(30 * time.Second)
-			tc.SetReadBuffer(BUFFER_SIZE)
-			tc.SetWriteBuffer(BUFFER_SIZE)
-		}
-
-		return conn, nil
 	}
 }
 
